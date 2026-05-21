@@ -1,0 +1,10 @@
+[package]
+name = "gb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sdl2 = "0.38.0"
+
+[profile.dev]
+opt-level = 1
