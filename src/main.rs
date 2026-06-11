@@ -1,19 +1,25 @@
 #![feature(int_lowest_highest_one)]
+#![feature(thread_sleep_until)]
+#![feature(integer_extend_truncate)]
 #![warn(clippy::pedantic)]
 #![allow(
 	clippy::too_many_lines,
 	clippy::similar_names,
 	clippy::cast_possible_truncation,
 	clippy::missing_errors_doc,
-	clippy::missing_panics_doc
+	clippy::missing_panics_doc,
+	clippy::struct_excessive_bools,
 )]
 
 
 use std::collections::HashSet;
+use std::ops::Add;
+use std::time::{Duration, Instant};
 use sdl2::controller::{GameController, self};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use timer::Timer;
+use crate::audio::Audio;
 use crate::memory::{MemoryMapper};
 use crate::timer::TimerReturn;
 
@@ -21,6 +27,7 @@ pub mod cpu;
 pub mod memory;
 pub mod timer;
 pub mod ppu;
+mod audio;
 
 mod mmio {
 	pub const JOYPAD: u16 = 0xff00;
@@ -29,6 +36,9 @@ mod mmio {
 	pub const TIMER_MODULO: u16 = 0xff06;
 	pub const TIMER_CONTROL: u16 = 0xff07;
 	pub const PENDING_INTERRUPTS: u16 = 0xff0f;
+	pub const AUDIO_VOLUME: u16 = 0xff24;
+	pub const AUDIO_PANNING: u16 = 0xff25;
+	pub const AUDIO_CONTROL: u16 = 0xff26;
 	pub const LCD_CONTROL: u16 = 0xff40;
 	pub const LCD_STATUS: u16 = 0xff41;
 	pub const SCROLL_Y: u16 = 0xff42;
@@ -47,10 +57,11 @@ mod mmio {
 struct System {
 	pressed_keys: HashSet<Keycode>,
 	timer: Timer,
-	mapper: Box<dyn MemoryMapper>,
+	memory: Box<dyn MemoryMapper>,
 	oam: [u8; 0xa0],
 	joypad_selection: u8,
-	controller: Option<GameController>
+	controller: Option<GameController>,
+	audio: Audio,
 }
 
 const JOYSTICK_DEADZONE: i16 = 3000;
@@ -88,8 +99,9 @@ impl System {
 			mmio::TIMER_COUNTER => self.timer.counter,
 			mmio::TIMER_MODULO => self.timer.modulo,
 			mmio::TIMER_CONTROL => self.timer.control,
-			mmio::PENDING_INTERRUPTS => self.mapper.read(address) | 0b1110_0000,
-			_ => self.mapper.read(address)
+			mmio::PENDING_INTERRUPTS => self.memory.read(address) | 0b1110_0000,
+			0xff10..0xff40 => self.audio.read_register(address),
+			_ => self.memory.read(address)
 		}
 	}
 	
@@ -100,14 +112,15 @@ impl System {
 			mmio::OAM_DMA_TRANSFER => {
 				let source_address = u16::from(value) * 0x100;
 				for i in 0..0xa0 {
-					self.oam[usize::from(i)] = self.mapper.read(source_address + i);
+					self.oam[usize::from(i)] = self.memory.read(source_address + i);
 				}
 			},
 			mmio::TIMER_DIVIDER => self.timer.cycle = 0,
 			mmio::TIMER_COUNTER => self.timer.counter = value,
 			mmio::TIMER_MODULO => self.timer.modulo = value,
 			mmio::TIMER_CONTROL => self.timer.control = value,
-			address => self.mapper.write(address, value)
+			0xff10..0xff40 => self.audio.write_register(address, value),
+			address => self.memory.write(address, value)
 		}
 	}
 	
@@ -117,6 +130,10 @@ impl System {
 	}
 }
 
+const SYNC_CYCLES: u16 = 2u16.pow(14);
+const CYCLES_PER_SECOND: u32 = 4_194_304 / 4;
+const SYNC_CYCLE_DURATION: u32 = (Duration::from_secs(1).as_nanos() as u32) / (CYCLES_PER_SECOND / SYNC_CYCLES as u32);
+
 fn main() {
 	let path = std::env::args().nth(1).expect("No path given");
 	let rom = std::fs::read(path).expect("ROM file not found");
@@ -124,29 +141,27 @@ fn main() {
 	let sdl_context = sdl2::init().unwrap();
 	let controllers = sdl_context.game_controller().unwrap();
 	let num_joysticks = controllers.num_joysticks().unwrap();
-	let game_controller = (0..num_joysticks).find(|i| controllers.is_game_controller(*i)).and_then(|i| controllers.open(i).ok());
-	let video_subsystem = sdl_context.video().unwrap();
-	let window = video_subsystem.window("GameGirl", (ppu::SCREEN_WIDTH * 2) as u32, (ppu::SCREEN_HEIGHT * 2) as u32)
-		.position_centered()
-		.build()
-		.unwrap();
-	let mut canvas = window.into_canvas().build().unwrap();
-	canvas.set_scale(2.0, 2.0).unwrap();
+	let controller = (0..num_joysticks).find(|i| controllers.is_game_controller(*i)).and_then(|i| controllers.open(i).ok());
 	
-	let mut ppu = ppu::PPU::new(canvas);
+	let mut ppu = ppu::PPU::new(&sdl_context.video().unwrap());
 	let mut cpu = cpu::CPU::default();
-	let mut mapper: Box<dyn MemoryMapper> = match rom[0x147] {
-		0 => Box::new(memory::RomOnly { rom, ram: vec![0; 0x8000] }),
+	let mut memory: Box<dyn MemoryMapper> = match rom[0x147] {
+		0 => Box::new(memory::RomOnly::new(rom)),
 		1..=3 => Box::new(memory::MBC1::new(rom)),
+		0x11..=0x13 => Box::new(memory::MBC3::new(rom)),
 		_ => unimplemented!(),
 	};
-	mapper.write(mmio::JOYPAD, 0b1111);
+	memory.write(mmio::JOYPAD, 0b1111);
 	let timer = Timer::default();
-	let mut sys = System { mapper, timer, oam: [0; 0xa0], pressed_keys: HashSet::new(), joypad_selection: 0, controller: game_controller };
+	
+	let audio = Audio::new(&sdl_context.audio().unwrap());
+	
+	let mut sys = System { memory, timer, oam: [0; 0xa0], pressed_keys: HashSet::new(), joypad_selection: 0, controller, audio };
 	sys.write(mmio::LCD_CONTROL, 0x91);
 	sys.write(mmio::BG_PALETTE, 0xfc);
 	
 	let mut event_pump = sdl_context.event_pump().unwrap();
+	let mut time = Instant::now();
 	'running: loop {
 		let mut cycle = cpu.cycle;
 		cpu.step(&mut sys);
@@ -161,20 +176,31 @@ fn main() {
 			if sys.timer.step() == TimerReturn::Overflow {
 				sys.interrupt(1 << 2);
 			}
+			sys.audio.step();
+			
+			if cycle.is_multiple_of(SYNC_CYCLES) {
+				for event in event_pump.poll_iter() {
+					match event {
+						Event::Quit { .. } => {
+							sys.memory.save();
+							break 'running
+						},
+						Event::KeyDown { keycode: Some(keycode), .. } => {
+							sys.pressed_keys.insert(keycode);
+						}
+						Event::KeyUp { keycode: Some(keycode), .. } => {
+							sys.pressed_keys.remove(&keycode);
+						}
+						_ => {}
+					}
+				}
+				let sleep_until = time.add(Duration::new(0, SYNC_CYCLE_DURATION));
+				assert!(!sleep_until.duration_since(Instant::now()).is_zero(), "Lag");
+				std::thread::sleep_until(sleep_until);
+				time = sleep_until;
+			}
 			
 			cycle = cycle.wrapping_add(1);
-		}
-		for event in event_pump.poll_iter() {
-			match event {
-				Event::Quit { .. } => break 'running,
-				Event::KeyDown { keycode: Some(keycode), .. } => {
-					sys.pressed_keys.insert(keycode);
-				}
-				Event::KeyUp { keycode: Some(keycode), .. } => {
-					sys.pressed_keys.remove(&keycode);
-				}
-				_ => {}
-			}
 		}
 	}
 }
